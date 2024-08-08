@@ -1,8 +1,12 @@
 const dgram = require('dgram');
 const net = require('net');
 const { exec } = require('child_process');
-const TUN = require('node-tun');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 const sodium = require('libsodium-wrappers');
+const noise = require('noise-protocol');
+const TUN = require('node-tun');
 const winston = require('winston');
 
 // 配置日志
@@ -18,63 +22,46 @@ const logger = winston.createLogger({
     ]
 });
 
-// 密钥初始化
-async function initializeCrypto() {
+// 加载密钥对
+function saveKeyPair(keyPair, filename) {
+    const filepath = path.join(os.homedir(), filename);
+    fs.writeFileSync(filepath, JSON.stringify(keyPair));
+    fs.chmodSync(filepath, 0o600); // 仅允许拥有者访问
+}
+
+function loadKeyPair(filename) {
+    const filepath = path.join(os.homedir(), filename);
+    if (fs.existsSync(filepath)) {
+        const keyPairData = fs.readFileSync(filepath, 'utf8');
+        return JSON.parse(keyPairData);
+    }
+    return null;
+}
+
+// 初始化密钥交换和加密
+async function initializeHandshake() {
     await sodium.ready;
 
-    const keyPairA = sodium.crypto_kx_keypair();
-    const keyPairB = sodium.crypto_kx_keypair();
+    // 生成服务端静态密钥对
+    const serverStaticKeyPair = loadKeyPair('server_keys.json') || noise.generateKeypair(sodium.crypto_box_keypair());
+    saveKeyPair(serverStaticKeyPair, 'server_keys.json');
 
-    const sharedA = sodium.crypto_kx_client_session_keys(keyPairA.publicKey, keyPairA.privateKey, keyPairB.publicKey);
-    const sharedB = sodium.crypto_kx_server_session_keys(keyPairB.publicKey, keyPairB.privateKey, keyPairA.publicKey);
+    // 生成临时密钥对（用于Noise协议）
+    const ephemeralKeyPair = noise.generateKeypair(sodium.crypto_box_keypair());
 
-    return {
-        clientKeys: keyPairA,
-        serverKeys: keyPairB,
-        sharedA,
-        sharedB
-    };
+    return { serverStaticKeyPair, ephemeralKeyPair };
 }
 
-// 加密与解密
-function encryptMessage(message, key) {
-    const nonce = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES);
-    const ciphertext = sodium.crypto_secretbox_easy(message, nonce, key);
-    return { ciphertext, nonce };
+function startHandshake(clientPublicKey, serverStaticKeyPair, ephemeralKeyPair) {
+    const noiseState = noise.initialize('Noise_IK_25519_ChaChaPoly_SHA256', true, serverStaticKeyPair, clientPublicKey);
+    const handshakeMessage = noise.writeMessage(noiseState, null, ephemeralKeyPair.publicKey);
+    return { noiseState, handshakeMessage };
 }
 
-function decryptMessage(ciphertext, nonce, key) {
-    return sodium.crypto_secretbox_open_easy(ciphertext, nonce, key);
-}
-
-// 防重放机制
-const packetSequence = new Map(); // 防重放机制
-
-function isDuplicatePacket(sequenceNumber, destination) {
-    const key = `${sequenceNumber}:${destination}`;
-    if (packetSequence.has(key)) {
-        return true;
-    }
-    packetSequence.set(key, Date.now());
-    return false;
-}
-
-function handlePacket(data, key) {
-    try {
-        const nonce = data.slice(0, sodium.crypto_secretbox_NONCEBYTES);
-        const ciphertext = data.slice(sodium.crypto_secretbox_NONCEBYTES);
-        const decryptedMessage = decryptMessage(ciphertext, nonce, key);
-
-        const { sequenceNumber, ...message } = JSON.parse(decryptedMessage.toString());
-
-        if (!isDuplicatePacket(sequenceNumber, message.destination)) {
-            logger.info('Received valid packet:', message);
-        } else {
-            logger.info('Duplicate packet detected');
-        }
-    } catch (err) {
-        logger.error('Error processing packet:', err);
-    }
+function completeHandshake(noiseState, clientMessage) {
+    const { payload, noiseState: newState } = noise.readMessage(noiseState, clientMessage);
+    const { sharedSecret } = noise.finalize(newState);
+    return sharedSecret;
 }
 
 // 创建和配置 TUN 接口
@@ -121,11 +108,94 @@ async function setupNetwork() {
     }
 }
 
+// 加密与解密
+function secureEncrypt(message, key) {
+    const nonce = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES);
+    const ciphertext = sodium.crypto_aead_chacha20poly1305_encrypt(message, null, nonce, key);
+    return { ciphertext, nonce };
+}
+
+function secureDecrypt(ciphertext, nonce, key) {
+    return sodium.crypto_aead_chacha20poly1305_decrypt(ciphertext, null, nonce, key);
+}
+
+// 数据包处理与防重放攻击
+const lastReceivedSequence = {};
+
+function createDataPacket(type, sessionId, message, nonce, key) {
+    const packet = Buffer.alloc(16 + message.length);
+    packet.writeUInt32BE(type, 0);
+    packet.writeUInt32BE(sessionId, 4);
+    nonce.copy(packet, 8, 0, nonce.length);
+    const encryptedMessage = secureEncrypt(message, key);
+    encryptedMessage.ciphertext.copy(packet, 16);
+    return packet;
+}
+
+function parseDataPacket(packet, key) {
+    const type = packet.readUInt32BE(0);
+    const sessionId = packet.readUInt32BE(4);
+    const nonce = packet.slice(8, 16);
+    const encryptedMessage = packet.slice(16);
+
+    const message = secureDecrypt(encryptedMessage, nonce, key);
+
+    return { type, sessionId, message };
+}
+
+function isReplayAttack(packet, sessionId) {
+    const { sequenceNumber } = parseDataPacket(packet, sessionId);
+    if (sequenceNumber <= lastReceivedSequence[sessionId]) {
+        return true;
+    }
+    lastReceivedSequence[sessionId] = sequenceNumber;
+    return false;
+}
+
+function handlePacket(data, key) {
+    try {
+        const { type, sessionId, message } = parseDataPacket(data, key);
+
+        if (!isReplayAttack(data, sessionId)) {
+            logger.info('Received valid packet:', message.toString());
+            // 处理消息
+        } else {
+            logger.warn('Duplicate packet detected');
+        }
+    } catch (err) {
+        logger.error('Error processing packet:', err);
+    }
+}
+
+// 动态配置更新
+let config = {};
+
+function loadConfig(filePath) {
+    try {
+        const data = fs.readFileSync(filePath, 'utf8');
+        config = JSON.parse(data);
+        logger.info('Config loaded:', config);
+    } catch (error) {
+        logger.error('Failed to load config:', error);
+    }
+}
+
+function updateConfig(newConfig) {
+    config = { ...config, ...newConfig };
+    logger.info('Config updated:', config);
+}
+
+fs.watch('config.json', (eventType, filename) => {
+    if (eventType === 'change') {
+        loadConfig(filename);
+    }
+});
+
 // UDP 服务器
-function startUDPServer(keys) {
+function startUDPServer(sharedKey) {
     const server = dgram.createSocket('udp4');
     server.on('message', (msg) => {
-        handlePacket(msg, keys.sharedB.sharedRx);
+        handlePacket(msg, sharedKey);
     });
 
     server.bind(12345, () => {
@@ -134,10 +204,10 @@ function startUDPServer(keys) {
 }
 
 // TCP 服务器
-function startTCPServer(keys) {
+function startTCPServer(sharedKey) {
     const server = net.createServer((socket) => {
         socket.on('data', (data) => {
-            handlePacket(data, keys.sharedB.sharedRx);
+            handlePacket(data, sharedKey);
         });
 
         socket.on('error', (err) => {
@@ -153,11 +223,23 @@ function startTCPServer(keys) {
 // 主函数
 async function main() {
     try {
-        const keys = await initializeCrypto();
+        // 初始化安全握手
+        const { serverStaticKeyPair, ephemeralKeyPair } = await initializeHandshake();
+
+        // 设置网络和接口
         await setupNetwork();
 
-        startUDPServer(keys);
-        startTCPServer(keys);
+        // 加载和更新配置
+        loadConfig('config.json');
+
+        // 启动服务器
+        const clientPublicKey = config.clientPublicKey; // 假设配置中包含客户端公钥
+        const { noiseState, handshakeMessage } = startHandshake(clientPublicKey, serverStaticKeyPair, ephemeralKeyPair);
+        const sharedKey = completeHandshake(noiseState, handshakeMessage);
+
+        startUDPServer(sharedKey);
+        startTCPServer(sharedKey);
+
     } catch (err) {
         logger.error('Initialization error:', err);
     }
