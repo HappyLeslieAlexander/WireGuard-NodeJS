@@ -5,15 +5,27 @@ const { execSync } = require('child_process');
 const os = require('os');
 const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
 
+// 配置文件路径
+const CONFIG_PATH = 'config.json';
+const INTERFACE_NAME = 'wg0';
+const PORT = 51820;
+
+// 全局变量
+let serverStaticKeyPair = generateKeyPair();
+
 // 初始化 libsodium
 async function initializeCrypto() {
     await sodium.ready;
     console.log('Crypto initialized');
 }
 
-// 密钥对生成
+// 生成密钥对
 function generateKeyPair() {
-    return sodium.crypto_kx_keypair();
+    const keyPair = sodium.crypto_kx_keypair();
+    return {
+        privateKey: keyPair.privateKey,
+        publicKey: keyPair.publicKey
+    };
 }
 
 // 加密与解密函数
@@ -71,9 +83,8 @@ function loadConfig(configPath) {
 }
 
 function applyConfigChanges(newConfig) {
-    Object.assign(serverConfig, newConfig);
-    // Apply configuration changes dynamically
-    console.log('Configuration updated:', serverConfig);
+    // 动态应用配置变化
+    console.log('Configuration updated:', newConfig);
 }
 
 // 解析和验证数据包
@@ -185,23 +196,23 @@ if (isMainThread) {
             server.close();
         });
 
-        server.bind(51820, () => {
-            console.log('Server is listening on port 51820');
+        server.bind(PORT, () => {
+            console.log(`Server is listening on port ${PORT}`);
         });
 
         // 轮换密钥
         setInterval(rotateKeys, 24 * 60 * 60 * 1000);
 
         // 创建TUN接口
-        createTunInterface('wg0');
+        createTunInterface(INTERFACE_NAME);
 
         // 配置网络路由
         configureRoutes();
 
         // 配置动态更新
-        fs.watchFile('config.json', (curr, prev) => {
+        fs.watchFile(CONFIG_PATH, (curr, prev) => {
             console.log('Configuration file changed');
-            const newConfig = loadConfig('config.json');
+            const newConfig = loadConfig(CONFIG_PATH);
             applyConfigChanges(newConfig);
         });
     });
