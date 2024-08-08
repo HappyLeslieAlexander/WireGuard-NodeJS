@@ -1,248 +1,213 @@
-const dgram = require('dgram');
-const net = require('net');
-const { exec } = require('child_process');
 const fs = require('fs');
-const path = require('path');
-const os = require('os');
 const sodium = require('libsodium-wrappers');
-const noise = require('noise-protocol');
-const TUN = require('node-tun');
-const winston = require('winston');
+const dgram = require('dgram');
+const { execSync } = require('child_process');
+const os = require('os');
+const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
 
-// 配置日志
-const logger = winston.createLogger({
-    level: 'info',
-    format: winston.format.combine(
-        winston.format.timestamp(),
-        winston.format.json()
-    ),
-    transports: [
-        new winston.transports.File({ filename: 'server.log' }),
-        new winston.transports.Console()
-    ]
-});
-
-// 加载密钥对
-function saveKeyPair(keyPair, filename) {
-    const filepath = path.join(os.homedir(), filename);
-    fs.writeFileSync(filepath, JSON.stringify(keyPair));
-    fs.chmodSync(filepath, 0o600); // 仅允许拥有者访问
-}
-
-function loadKeyPair(filename) {
-    const filepath = path.join(os.homedir(), filename);
-    if (fs.existsSync(filepath)) {
-        const keyPairData = fs.readFileSync(filepath, 'utf8');
-        return JSON.parse(keyPairData);
-    }
-    return null;
-}
-
-// 初始化密钥交换和加密
-async function initializeHandshake() {
+// 初始化libsodium
+async function initializeCrypto() {
     await sodium.ready;
-
-    // 生成服务端静态密钥对
-    const serverStaticKeyPair = loadKeyPair('server_keys.json') || noise.generateKeypair(sodium.crypto_box_keypair());
-    saveKeyPair(serverStaticKeyPair, 'server_keys.json');
-
-    // 生成临时密钥对（用于Noise协议）
-    const ephemeralKeyPair = noise.generateKeypair(sodium.crypto_box_keypair());
-
-    return { serverStaticKeyPair, ephemeralKeyPair };
+    console.log('Crypto initialized');
 }
 
-function startHandshake(clientPublicKey, serverStaticKeyPair, ephemeralKeyPair) {
-    const noiseState = noise.initialize('Noise_IK_25519_ChaChaPoly_SHA256', true, serverStaticKeyPair, clientPublicKey);
-    const handshakeMessage = noise.writeMessage(noiseState, null, ephemeralKeyPair.publicKey);
-    return { noiseState, handshakeMessage };
+// 生成密钥对（Curve25519）
+function generateKeyPair() {
+    return sodium.crypto_kx_keypair();
 }
 
-function completeHandshake(noiseState, clientMessage) {
-    const { payload, noiseState: newState } = noise.readMessage(noiseState, clientMessage);
-    const { sharedSecret } = noise.finalize(newState);
-    return sharedSecret;
+// 恒定时间的密钥比较
+function secureCompare(a, b) {
+    return sodium.memcmp(a, b);
 }
 
-// 创建和配置 TUN 接口
-async function createTUNInterface() {
-    return new Promise((resolve, reject) => {
-        TUN.create({ name: 'tun0' }, (err, tun) => {
-            if (err) {
-                return reject(err);
-            }
-            resolve(tun);
-        });
-    });
-}
-
-async function configureNetworkInterface() {
-    try {
-        await executeCommand('ip addr add 10.0.0.1/24 dev tun0');
-        await executeCommand('ip link set dev tun0 up');
-        logger.info('TUN interface configured');
-    } catch (err) {
-        logger.error('Error configuring TUN interface:', err);
-    }
-}
-
-function executeCommand(command) {
-    return new Promise((resolve, reject) => {
-        exec(command, (error, stdout, stderr) => {
-            if (error) {
-                logger.error('Command execution error:', error);
-                return reject(error);
-            }
-            resolve(stdout);
-        });
-    });
-}
-
-async function setupNetwork() {
-    try {
-        const tun = await createTUNInterface();
-        logger.info('TUN interface created:', tun);
-        await configureNetworkInterface();
-    } catch (err) {
-        logger.error('Error setting up network:', err);
-    }
-}
-
-// 加密与解密
+// 使用恒定时间的加密函数
 function secureEncrypt(message, key) {
-    const nonce = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES);
-    const ciphertext = sodium.crypto_aead_chacha20poly1305_encrypt(message, null, nonce, key);
+    const nonce = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_IETF_NPUBBYTES);
+    const ciphertext = sodium.crypto_aead_chacha20poly1305_ietf_encrypt(message, null, null, nonce, key);
     return { ciphertext, nonce };
 }
 
 function secureDecrypt(ciphertext, nonce, key) {
-    return sodium.crypto_aead_chacha20poly1305_decrypt(ciphertext, null, nonce, key);
-}
-
-// 数据包处理与防重放攻击
-const lastReceivedSequence = {};
-
-function createDataPacket(type, sessionId, message, nonce, key) {
-    const packet = Buffer.alloc(16 + message.length);
-    packet.writeUInt32BE(type, 0);
-    packet.writeUInt32BE(sessionId, 4);
-    nonce.copy(packet, 8, 0, nonce.length);
-    const encryptedMessage = secureEncrypt(message, key);
-    encryptedMessage.ciphertext.copy(packet, 16);
-    return packet;
-}
-
-function parseDataPacket(packet, key) {
-    const type = packet.readUInt32BE(0);
-    const sessionId = packet.readUInt32BE(4);
-    const nonce = packet.slice(8, 16);
-    const encryptedMessage = packet.slice(16);
-
-    const message = secureDecrypt(encryptedMessage, nonce, key);
-
-    return { type, sessionId, message };
-}
-
-function isReplayAttack(packet, sessionId) {
-    const { sequenceNumber } = parseDataPacket(packet, sessionId);
-    if (sequenceNumber <= lastReceivedSequence[sessionId]) {
-        return true;
+    try {
+        const message = sodium.crypto_aead_chacha20poly1305_ietf_decrypt(null, ciphertext, null, nonce, key);
+        return message;
+    } catch (error) {
+        console.error('Decryption failed:', error);
+        throw new Error('Decryption failed');
     }
-    lastReceivedSequence[sessionId] = sequenceNumber;
+}
+
+// 初始化滑动窗口，防止重放攻击
+const replayWindow = {};
+
+function initializeReplayWindow(sessionId) {
+    replayWindow[sessionId] = {
+        maxSeq: 0,
+        window: 0
+    };
+}
+
+function updateReplayWindow(sessionId, sequenceNumber) {
+    const { maxSeq, window } = replayWindow[sessionId];
+    
+    if (sequenceNumber > maxSeq) {
+        const shift = sequenceNumber - maxSeq;
+        replayWindow[sessionId].window = (window << shift) | 1;
+        replayWindow[sessionId].maxSeq = sequenceNumber;
+    } else {
+        const offset = maxSeq - sequenceNumber;
+        replayWindow[sessionId].window |= (1 << offset);
+    }
+}
+
+function isReplayAttack(sessionId, sequenceNumber) {
+    const { maxSeq, window } = replayWindow[sessionId];
+    
+    if (sequenceNumber <= maxSeq) {
+        const offset = maxSeq - sequenceNumber;
+        if ((window & (1 << offset)) !== 0) {
+            return true; // 检测到重放攻击
+        }
+    }
     return false;
 }
 
-function handlePacket(data, key) {
-    try {
-        const { type, sessionId, message } = parseDataPacket(data, key);
-
-        if (!isReplayAttack(data, sessionId)) {
-            logger.info('Received valid packet:', message.toString());
-            // 处理消息
-        } else {
-            logger.warn('Duplicate packet detected');
-        }
-    } catch (err) {
-        logger.error('Error processing packet:', err);
-    }
+// 处理配置文件
+function loadConfig(configPath) {
+    return JSON.parse(fs.readFileSync(configPath, 'utf8'));
 }
 
-// 动态配置更新
-let config = {};
+// 解析WireGuard数据包
+function parseDataPacket(packet) {
+    const type = packet.readUInt8(0);
+    const sessionId = packet.slice(1, 9).toString('hex');
+    const sequenceNumber = packet.readUInt32BE(9);
+    const payload = packet.slice(13);
+    return { type, sessionId, sequenceNumber, payload };
+}
 
-function loadConfig(filePath) {
+// 验证数据包
+function verifyPacket(packet, key) {
+    const { type, sessionId, sequenceNumber, payload } = parseDataPacket(packet);
+
+    if (isReplayAttack(sessionId, sequenceNumber)) {
+        throw new Error('Replay attack detected');
+    }
+
+    const isValid = sodium.crypto_aead_chacha20poly1305_ietf_verify(payload, key);
+
+    if (!isValid) {
+        throw new Error('Packet verification failed');
+    }
+
+    updateReplayWindow(sessionId, sequenceNumber);
+
+    return payload;
+}
+
+// 创建WireGuard数据包
+function createWireGuardPacket(type, sessionId, message, key) {
+    const sequenceNumber = sodium.randombytes_buf(4);
+    const packet = Buffer.concat([Buffer.from([type]), Buffer.from(sessionId), sequenceNumber, message]);
+    
+    const { ciphertext, nonce } = secureEncrypt(packet, key);
+
+    return Buffer.concat([nonce, ciphertext]);
+}
+
+// 清理密钥
+function clearKey(key) {
+    sodium.sodium_memzero(key);
+}
+
+// 安全存储密钥
+function secureStoreKey(key) {
+    const secureMemory = sodium.sodium_malloc(key.length);
+    sodium.sodium_memcpy(secureMemory, key);
+    return secureMemory;
+}
+
+// 密钥轮换
+function rotateKeys() {
+    serverStaticKeyPair = generateKeyPair();
+    console.log('Keys rotated');
+}
+
+// 更新服务器配置
+let serverConfig = loadConfig('config.json');
+let serverStaticKeyPair = generateKeyPair();
+
+function updateServerConfig(newConfig) {
+    serverConfig = { ...serverConfig, ...newConfig };
+    if (newConfig.publicKey || newConfig.privateKey) {
+        serverStaticKeyPair = generateKeyPair();
+    }
+    console.log('Server configuration updated');
+}
+
+// 处理TUN接口创建
+function createTunInterface(interfaceName) {
+    if (os.platform() !== 'linux') {
+        throw new Error('This implementation currently supports only Linux platform.');
+    }
+
     try {
-        const data = fs.readFileSync(filePath, 'utf8');
-        config = JSON.parse(data);
-        logger.info('Config loaded:', config);
+        execSync(`ip tuntap add dev ${interfaceName} mode tun`);
+        execSync(`ip addr add 10.0.0.1/24 dev ${interfaceName}`);
+        execSync(`ip link set dev ${interfaceName} up`);
+        console.log(`TUN interface ${interfaceName} created successfully.`);
     } catch (error) {
-        logger.error('Failed to load config:', error);
+        console.error(`Failed to create TUN interface: ${error.message}`);
+        throw error;
     }
 }
 
-function updateConfig(newConfig) {
-    config = { ...config, ...newConfig };
-    logger.info('Config updated:', config);
-}
-
-fs.watch('config.json', (eventType, filename) => {
-    if (eventType === 'change') {
-        loadConfig(filename);
-    }
-});
-
-// UDP 服务器
-function startUDPServer(sharedKey) {
+// 启动服务线程
+if (isMainThread) {
     const server = dgram.createSocket('udp4');
-    server.on('message', (msg) => {
-        handlePacket(msg, sharedKey);
-    });
 
-    server.bind(12345, () => {
-        logger.info('UDP Server listening on port 12345');
-    });
-}
-
-// TCP 服务器
-function startTCPServer(sharedKey) {
-    const server = net.createServer((socket) => {
-        socket.on('data', (data) => {
-            handlePacket(data, sharedKey);
+    server.on('message', (msg, rinfo) => {
+        const worker = new Worker(__filename, {
+            workerData: {
+                msg: msg,
+                rinfo: rinfo,
+                key: serverStaticKeyPair.privateKey
+            }
         });
 
-        socket.on('error', (err) => {
-            logger.error('TCP Server error:', err);
+        worker.on('message', (result) => {
+            console.log(`Processed message from ${rinfo.address}:${rinfo.port}`);
+        });
+
+        worker.on('error', (error) => {
+            console.error(`Worker error: ${error.message}`);
         });
     });
 
-    server.listen(12346, () => {
-        logger.info('TCP Server listening on port 12346');
+    server.on('error', (err) => {
+        console.error(`Server error:\n${err.stack}`);
+        server.close();
     });
-}
 
-// 主函数
-async function main() {
+    server.bind(51820, () => {
+        console.log('Server is listening on port 51820');
+    });
+
+    // 轮换密钥，每24小时
+    setInterval(rotateKeys, 24 * 60 * 60 * 1000);
+
+    // 创建TUN接口
+    createTunInterface('wg0');
+
+} else {
+    // Worker 线程处理加密和解密任务
+    const { msg, rinfo, key } = workerData;
     try {
-        // 初始化安全握手
-        const { serverStaticKeyPair, ephemeralKeyPair } = await initializeHandshake();
-
-        // 设置网络和接口
-        await setupNetwork();
-
-        // 加载和更新配置
-        loadConfig('config.json');
-
-        // 启动服务器
-        const clientPublicKey = config.clientPublicKey; // 假设配置中包含客户端公钥
-        const { noiseState, handshakeMessage } = startHandshake(clientPublicKey, serverStaticKeyPair, ephemeralKeyPair);
-        const sharedKey = completeHandshake(noiseState, handshakeMessage);
-
-        startUDPServer(sharedKey);
-        startTCPServer(sharedKey);
-
-    } catch (err) {
-        logger.error('Initialization error:', err);
+        const decryptedMessage = verifyPacket(msg, key);
+        // 处理解密后的消息...
+        parentPort.postMessage('done');
+    } catch (error) {
+        console.error(`Failed to process message: ${error.message}`);
     }
 }
-
-main();
