@@ -19,13 +19,22 @@ if [ ! -d "$NODE_MODULES_DIR" ]; then
     npm install libsodium-wrappers
 fi
 
-# 确保配置文件存在
+# 生成配置文件
 if [ ! -f "$CONFIG_FILE" ]; then
-    echo "配置文件 $CONFIG_FILE 不存在，请创建该文件。"
-    exit 1
+    echo "生成默认的配置文件 $CONFIG_FILE..."
+    cat > "$CONFIG_FILE" <<EOL
+{
+    "listenPort": 51820,
+    "network": "10.0.0.1/24",
+    "privateKey": "$(openssl rand -base64 32)",
+    "allowedIPs": "10.0.0.2/32",
+    "endpoint": "localhost:51820"
+}
+EOL
+    echo "配置文件已生成。请根据需要修改 $CONFIG_FILE。"
 fi
 
-# 确保密钥文件存在
+# 生成私钥文件
 if [ ! -f "$PRIVATE_KEY_FILE" ]; then
     echo "生成 WireGuard 私钥文件..."
     openssl rand -base64 32 > "$PRIVATE_KEY_FILE"
