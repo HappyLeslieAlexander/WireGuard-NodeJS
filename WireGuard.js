@@ -5,27 +5,15 @@ const { execSync } = require('child_process');
 const os = require('os');
 const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
 
-// 配置文件路径
-const CONFIG_PATH = 'config.json';
-const INTERFACE_NAME = 'wg0';
-const PORT = 51820;
-
-// 全局变量
-let serverStaticKeyPair = generateKeyPair();
-
 // 初始化 libsodium
 async function initializeCrypto() {
     await sodium.ready;
     console.log('Crypto initialized');
 }
 
-// 生成密钥对
+// 密钥对生成
 function generateKeyPair() {
-    const keyPair = sodium.crypto_kx_keypair();
-    return {
-        privateKey: keyPair.privateKey,
-        publicKey: keyPair.publicKey
-    };
+    return sodium.crypto_kx_keypair();
 }
 
 // 加密与解密函数
@@ -83,8 +71,9 @@ function loadConfig(configPath) {
 }
 
 function applyConfigChanges(newConfig) {
-    // 动态应用配置变化
-    console.log('Configuration updated:', newConfig);
+    Object.assign(serverConfig, newConfig);
+    // Apply configuration changes dynamically
+    console.log('Configuration updated:', serverConfig);
 }
 
 // 解析和验证数据包
@@ -151,6 +140,7 @@ function createTunInterface(interfaceName) {
     try {
         execSync(`ip tuntap add dev ${interfaceName} mode tun`);
         execSync(`ip addr add 10.0.0.1/24 dev ${interfaceName}`);
+        execSync(`ip addr add fd00::1/64 dev ${interfaceName}`);
         execSync(`ip link set dev ${interfaceName} up`);
         console.log(`TUN interface ${interfaceName} created successfully.`);
     } catch (error) {
@@ -162,9 +152,13 @@ function createTunInterface(interfaceName) {
 // 路由配置
 function configureRoutes() {
     execSync('sysctl -w net.ipv4.ip_forward=1');
+    execSync('sysctl -w net.ipv6.conf.all.forwarding=1');
     execSync('iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE');
+    execSync('ip6tables -t nat -A POSTROUTING -o eth0 -j MASQUERADE');
     execSync('iptables -A FORWARD -i wg0 -o eth0 -j ACCEPT');
+    execSync('ip6tables -A FORWARD -i wg0 -o eth0 -j ACCEPT');
     execSync('iptables -A FORWARD -i eth0 -o wg0 -j ACCEPT');
+    execSync('ip6tables -A FORWARD -i eth0 -o wg0 -j ACCEPT');
     console.log('Network routing configured');
 }
 
@@ -196,23 +190,23 @@ if (isMainThread) {
             server.close();
         });
 
-        server.bind(PORT, () => {
-            console.log(`Server is listening on port ${PORT}`);
+        server.bind(51820, () => {
+            console.log('Server is listening on port 51820');
         });
 
         // 轮换密钥
         setInterval(rotateKeys, 24 * 60 * 60 * 1000);
 
         // 创建TUN接口
-        createTunInterface(INTERFACE_NAME);
+        createTunInterface('wg0');
 
         // 配置网络路由
         configureRoutes();
 
         // 配置动态更新
-        fs.watchFile(CONFIG_PATH, (curr, prev) => {
+        fs.watchFile('config.json', (curr, prev) => {
             console.log('Configuration file changed');
-            const newConfig = loadConfig(CONFIG_PATH);
+            const newConfig = loadConfig('config.json');
             applyConfigChanges(newConfig);
         });
     });
